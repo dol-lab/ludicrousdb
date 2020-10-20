@@ -16,6 +16,8 @@ defined( 'ABSPATH' ) || exit;
  */
 class LudicrousDB extends wpdb {
 
+	public $servers = array();
+
 	/**
 	 * The last table that was queried
 	 *
@@ -561,71 +563,13 @@ class LudicrousDB extends wpdb {
 			$operation     = 'read';
 		}
 
-		// Try to reuse an existing connection
-		while ( isset( $this->dbhs[ $dbhname ] ) && $this->dbh_type_check( $this->dbhs[ $dbhname ] ) ) {
-
-			// Find the connection for incrementing counters
-			foreach ( array_keys( $this->db_connections ) as $i ) {
-				if ( $this->db_connections[ $i ]['dbhname'] == $dbhname ) {
-					$conn = &$this->db_connections[ $i ];
-				}
-			}
-
-			if ( isset( $server['name'] ) ) {
-				$name = $server['name'];
-
-				// A callback has specified a database name so it's possible the
-				// existing connection selected a different one.
-				if ( $name != $this->used_servers[ $dbhname ]['name'] ) {
-					if ( ! $this->select( $name, $this->dbhs[ $dbhname ] ) ) {
-
-						// This can happen when the user varies and lacks
-						// permission on the $name database
-						if ( isset( $conn['disconnect (select failed)'] ) ) {
-							++ $conn['disconnect (select failed)'];
-						} else {
-							$conn['disconnect (select failed)'] = 1;
-						}
-
-						$this->disconnect( $dbhname );
-						break;
-					}
-					$this->used_servers[ $dbhname ]['name'] = $name;
-				}
-			} else {
-				$name = $this->used_servers[ $dbhname ]['name'];
-			}
-
-			$this->current_host = $this->dbh2host[ $dbhname ];
-
-			// Keep this connection at the top of the stack to prevent disconnecting frequently-used connections
-			if ( $k = array_search( $dbhname, $this->open_connections, true ) ) {
-				unset( $this->open_connections[ $k ] );
-				$this->open_connections[] = $dbhname;
-			}
-
-			$this->last_used_server = $this->used_servers[ $dbhname ];
-			$this->last_connection  = compact( 'dbhname', 'name' );
-
-			if ( $this->should_mysql_ping( $dbhname ) && ! $this->check_connection( false, $this->dbhs[ $dbhname ] ) ) {
-				if ( isset( $conn['disconnect (ping failed)'] ) ) {
-					++ $conn['disconnect (ping failed)'];
-				} else {
-					$conn['disconnect (ping failed)'] = 1;
-				}
-
-				$this->disconnect( $dbhname );
-				break;
-			}
-
-			if ( isset( $conn['queries'] ) ) {
-				++ $conn['queries'];
-			} else {
-				$conn['queries'] = 1;
-			}
-
-			return $this->dbhs[ $dbhname ];
-		}
+		/*
+		 * We reuse the existing connection at a later stage (maybe_db_connect)
+		 * This might come with problems / existing servers?
+		$connection = $this->reuse_exsting_connection($dbhname);
+		if ( $connection ){
+			return $connection;
+		} */
 
 		if ( ! empty( $use_master ) && defined( 'MASTER_DB_DEAD' ) ) {
 			return $this->bail( 'We are updating the database. Please try back in 5 minutes. If you are posting to your blog please hit the refresh button on your browser in a few minutes to post the data again. It will be posted as soon as the database is back online.' );
@@ -637,6 +581,13 @@ class LudicrousDB extends wpdb {
 
 		// Put the groups in order by priority
 		ksort( $this->ludicrous_servers[ $dataset ][ $operation ] );
+
+		$this->maybe_db_connect( $dataset, $operation, $dbhname );
+		return $this->dbhs[ $dbhname ];
+
+	}
+
+	public function maybe_db_connect( $dataset, $operation, $dbhname ) {
 
 		// Make a list of at least $this->reconnect_retries connections to try, repeating as necessary.
 		$servers = array();
@@ -659,8 +610,8 @@ class LudicrousDB extends wpdb {
 			}
 		} while ( $tries_remaining < $this->reconnect_retries );
 
-		// Connect to a database server
-		do {
+		// Connect to a database server.
+		while ( true ) {
 			$unique_lagged_slaves = array();
 			$success              = false;
 
@@ -727,7 +678,7 @@ class LudicrousDB extends wpdb {
 					: $this->default_lag_threshold;
 
 				// Check for a lagged slave, if applicable
-				if ( empty( $use_master ) && empty( $write ) && empty ( $this->ignore_slave_lag ) && isset( $this->lag_threshold ) && ! isset( $server['host'] ) && ( $lagged_status = $this->get_lag_cache() ) === DB_LAG_BEHIND ) {
+				if ( empty( $use_master ) && empty( $write ) && empty( $this->ignore_slave_lag ) && isset( $this->lag_threshold ) && ! isset( $server['host'] ) && ( $lagged_status = $this->get_lag_cache() ) === DB_LAG_BEHIND ) {
 
 					// If it is the last lagged slave and it is with the best preference we will ignore its lag
 					if ( ! isset( $unique_lagged_slaves[ $host_and_port ] ) && $this->unique_servers == count( $unique_lagged_slaves ) + 1 && $group == $min_group ) {
@@ -747,7 +698,37 @@ class LudicrousDB extends wpdb {
 					 || empty( $this->check_tcp_responsiveness )
 					 || ( true === $tcp = $this->check_tcp_responsiveness( $host, $port, $timeout ) )
 				) {
-					$this->single_db_connect( $dbhname, $host_and_port, $user, $password );
+
+					$server_id = $host . $port . $user;// . $password; // you can uniquely identfy a server by this string.
+					if ( isset( $this->servers[ $server_id ] ) ) { // server has already been used.
+						if ( $this->servers[ $server_id ]['last_used_db'] // the database which was last used
+							!= $db_config['name'] ) { // the database we use now.
+							// error_log( "selecting dataset! $dataset" );
+							$selected = $this->select( $db_config['name'], $this->servers[ $server_id ]['link'] );
+							if ( ! $selected ) {
+
+								// This can happen when the user varies and lacks
+								// permission on the $name database
+								if ( isset( $conn['disconnect (select failed)'] ) ) {
+									++ $conn['disconnect (select failed)'];
+								} else {
+									$conn['disconnect (select failed)'] = 1;
+								}
+								$this->disconnect( $dbhname );
+								$this->dbhs[ $dbhname ] = false;
+							}
+						}
+						$this->dbhs[ $dbhname ] = &$this->servers[ $server_id ]['link'];
+						$this->servers[ $server_id ]['last_used_db'] = $db_config['name'];
+						return; // we don't only want to break the while-loop, but return.
+
+					} else {
+
+						$this->single_db_connect( $dbhname, $host_and_port, $user, $password );
+						$this->servers[ $server_id ]['link'] = &$this->dbhs[ $dbhname ];
+					}
+					$this->servers[ $server_id ]['last_used_db'] = $db_config['name'];
+
 				} else {
 					$this->dbhs[ $dbhname ] = false;
 				}
@@ -785,7 +766,7 @@ class LudicrousDB extends wpdb {
 							$this->dbh2host[ $dbhname ] = $host_and_port;
 
 							// Define these to avoid undefined variable notices
-							$queries = isset( $queries   ) ? $queries : 1; // phpcs:ignore VariableAnalysis.CodeAnalysis.VariableAnalysis.UndefinedVariable
+							$queries = isset( $queries ) ? $queries : 1; // phpcs:ignore VariableAnalysis.CodeAnalysis.VariableAnalysis.UndefinedVariable
 							$lag     = isset( $this->lag ) ? $this->lag : 0;
 
 							$this->last_connection    = compact( 'dbhname', 'host', 'port', 'user', 'name', 'tcp', 'elapsed', 'success', 'queries', 'lag' );
@@ -851,21 +832,23 @@ class LudicrousDB extends wpdb {
 					continue;
 				}
 
-				$this->run_callbacks( 'db_connection_error', array(
-					'host'      => $host,
-					'port'      => $port,
-					'operation' => $operation,
-					'table'     => $this->table,
-					'dataset'   => $dataset,
-					'dbhname'   => $dbhname,
-				) );
+				$this->run_callbacks(
+					'db_connection_error',
+					array(
+						'host'      => $host,
+						'port'      => $port,
+						'operation' => $operation,
+						'table'     => $this->table,
+						'dataset'   => $dataset,
+						'dbhname'   => $dbhname,
+					)
+				);
 
 				return $this->bail( "Unable to connect to {$host}:{$port} to {$operation} table '{$this->table}' ({$dataset})" );
 			}
 
 			break;
-		} while ( true );
-
+		}
 		$this->set_charset( $this->dbhs[ $dbhname ] );
 
 		$this->dbh                      = $this->dbhs[ $dbhname ]; // needed by $wpdb->_real_escape()
@@ -879,7 +862,85 @@ class LudicrousDB extends wpdb {
 			}
 		}
 
-		return $this->dbhs[ $dbhname ];
+
+	}
+
+	/**
+	 * ! This function is currently not used!
+	 *
+	 * @param [type] $dbhname
+	 * @return void
+	 */
+	public function reuse_exsting_connection( $dbhname ) {
+
+
+		// Try to reuse an existing connection
+		while ( isset( $this->dbhs[ $dbhname ] ) && $this->dbh_type_check( $this->dbhs[ $dbhname ] ) ) {
+
+			// Find the connection for incrementing counters
+			foreach ( array_keys( $this->db_connections ) as $i ) {
+				if ( $this->db_connections[ $i ]['dbhname'] == $dbhname ) {
+					$conn = &$this->db_connections[ $i ];
+				}
+			}
+
+			if ( isset( $server['name'] ) ) {
+				$name = $server['name'];
+
+				// A callback has specified a database name so it's possible the
+				// existing connection selected a different one.
+				if ( $name != $this->used_servers[ $dbhname ]['name'] ) {
+					if ( ! $this->select( $name, $this->dbhs[ $dbhname ] ) ) {
+
+						// This can happen when the user varies and lacks
+						// permission on the $name database
+						if ( isset( $conn['disconnect (select failed)'] ) ) {
+							++ $conn['disconnect (select failed)'];
+						} else {
+							$conn['disconnect (select failed)'] = 1;
+						}
+
+						$this->disconnect( $dbhname );
+						break;
+					}
+					$this->used_servers[ $dbhname ]['name'] = $name;
+				}
+			} else {
+				$name = $this->used_servers[ $dbhname ]['name'];
+			}
+			$name = $this->used_servers[ $dbhname ]['name'];
+
+			$this->current_host = $this->dbh2host[ $dbhname ];
+
+			// Keep this connection at the top of the stack to prevent disconnecting frequently-used connections
+			if ( $k = array_search( $dbhname, $this->open_connections, true ) ) {
+				unset( $this->open_connections[ $k ] );
+				$this->open_connections[] = $dbhname;
+			}
+
+			$this->last_used_server = $this->used_servers[ $dbhname ];
+			$this->last_connection  = compact( 'dbhname', 'name' );
+
+			if ( $this->should_mysql_ping( $dbhname ) && ! $this->check_connection( false, $this->dbhs[ $dbhname ] ) ) {
+				if ( isset( $conn['disconnect (ping failed)'] ) ) {
+					++ $conn['disconnect (ping failed)'];
+				} else {
+					$conn['disconnect (ping failed)'] = 1;
+				}
+
+				$this->disconnect( $dbhname );
+				break;
+			}
+
+			if ( isset( $conn['queries'] ) ) {
+				++ $conn['queries'];
+			} else {
+				$conn['queries'] = 1;
+			}
+
+			return $this->dbhs[ $dbhname ];
+		}
+		return false;
 	}
 
 	/**
@@ -1253,18 +1314,18 @@ class LudicrousDB extends wpdb {
 		$message  = '<h1>' . __( 'Error reconnecting to the database', 'ludicrousdb' ) . "</h1>\n";
 		$message .= '<p>' . sprintf(
 			/* translators: %s: database host */
-				__( 'This means that we lost contact with the database server at %s. This could mean your host&#8217;s database server is down.', 'ludicrousdb' ),
-				'<code>' . htmlspecialchars( $this->dbhost, ENT_QUOTES ) . '</code>'
-			) . "</p>\n";
+			__( 'This means that we lost contact with the database server at %s. This could mean your host&#8217;s database server is down.', 'ludicrousdb' ),
+			'<code>' . htmlspecialchars( $this->dbhost, ENT_QUOTES ) . '</code>'
+		) . "</p>\n";
 		$message .= "<ul>\n";
 		$message .= '<li>' . __( 'Are you sure that the database server is running?', 'ludicrousdb' ) . "</li>\n";
 		$message .= '<li>' . __( 'Are you sure that the database server is not under particularly heavy load?', 'ludicrousdb' ) . "</li>\n";
 		$message .= "</ul>\n";
 		$message .= '<p>' . sprintf(
 			/* translators: %s: support forums URL */
-				__( 'If you&#8217;re unsure what these terms mean you should probably contact your host. If you still need help you can always visit the <a href="%s">WordPress Support Forums</a>.', 'ludicrousdb' ),
-				__( 'https://wordpress.org/support/', 'ludicrousdb' )
-			) . "</p>\n";
+			__( 'If you&#8217;re unsure what these terms mean you should probably contact your host. If you still need help you can always visit the <a href="%s">WordPress Support Forums</a>.', 'ludicrousdb' ),
+			__( 'https://wordpress.org/support/', 'ludicrousdb' )
+		) . "</p>\n";
 
 		// We weren't able to reconnect, so we better bail.
 		$this->bail( $message, 'db_connect_fail' );
@@ -2017,14 +2078,18 @@ class LudicrousDB extends wpdb {
 			list( $type ) = explode( '(', $column->Type );  // phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase
 
 			// A binary/blob means the whole query gets treated like this.
-			if ( in_array( strtoupper( $type ), array(
-				'BINARY',
-				'VARBINARY',
-				'TINYBLOB',
-				'MEDIUMBLOB',
-				'BLOB',
-				'LONGBLOB',
-			), true ) ) {
+			if ( in_array(
+				strtoupper( $type ),
+				array(
+					'BINARY',
+					'VARBINARY',
+					'TINYBLOB',
+					'MEDIUMBLOB',
+					'BLOB',
+					'LONGBLOB',
+				),
+				true
+			) ) {
 				$this->table_charset[ $tablekey ] = 'binary';
 
 				return 'binary';
